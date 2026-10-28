@@ -8,6 +8,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Arrange project files
+        run: |
+          mkdir -p app/src/main/java/com/fieldtrack/app
+          [ -f AndroidManifest.xml ] && mv AndroidManifest.xml app/src/main/AndroidManifest.xml || true
+          [ -f LocationService.kt ] && mv LocationService.kt app/src/main/java/com/fieldtrack/app/ || true
+          [ -f MainActivity.kt ] && mv MainActivity.kt app/src/main/java/com/fieldtrack/app/ || true
+          cat > settings.gradle <<'EOT'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins {
+                  id 'com.android.application' version '8.5.2'
+                  id 'org.jetbrains.kotlin.android' version '1.9.24'
+              }
+          }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FieldTrack"
+          include ':app'
+          EOT
+          echo '// top-level' > build.gradle
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > app/build.gradle <<'EOT'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+              namespace 'com.fieldtrack.app'
+              compileSdk 34
+              defaultConfig { applicationId 'com.fieldtrack.app'; minSdk 24; targetSdk 34; versionCode 1; versionName '1.0' }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies { implementation 'androidx.core:core-ktx:1.13.1' }
+          EOT
+          find . -path ./.git -prune -o -type f -print | head -30
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -20,4 +52,3 @@ jobs:
         with:
           name: fieldtrack-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          
