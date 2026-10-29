@@ -14,6 +14,14 @@ import android.net.Network
 import android.os.*
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -40,6 +48,8 @@ class LocationService : Service(), LocationListener {
     private var on = false
     @Volatile private var busy = false
     private var netCb: ConnectivityManager.NetworkCallback? = null
+    private var fused: FusedLocationProviderClient? = null
+    private var cb: LocationCallback? = null
     private val tick = object : Runnable { override fun run() { upload(); h.postDelayed(this, 20000) } }
 
     override fun onBind(i: Intent?): IBinder? = null
@@ -73,10 +83,9 @@ class LocationService : Service(), LocationListener {
 
     private fun begin() {
         if (on) return
-        on = true
+        on = true; kVar = -1f; sTs = 0L
         wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ft:trk").also { it.acquire() }
-        try { lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 15000, 0f, this, Looper.getMainLooper()) } catch (e: Exception) {}
-        try { lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 30000, 0f, this, Looper.getMainLooper()) } catch (e: Exception) {}
+        startLocation()
         try {
             val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
             netCb = object : ConnectivityManager.NetworkCallback() { override fun onAvailable(n: Network) { upload() } }
@@ -87,15 +96,58 @@ class LocationService : Service(), LocationListener {
     private fun endTracking() {
         on = false
         try { lm.removeUpdates(this) } catch (e: Exception) {}
+        try { cb?.let { fused?.removeLocationUpdates(it) } } catch (e: Exception) {}
         wl?.let { if (it.isHeld) it.release() }
     }
 
+    private var kLat = 0.0; private var kLng = 0.0; private var kVar = -1f; private var kTs = 0L
+    private var sLat = 0.0; private var sLng = 0.0; private var sTs = 0L
+
+    private fun startLocation() {
+        val ok = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(this) == ConnectionResult.SUCCESS
+        if (ok) {
+            try {
+                val f = LocationServices.getFusedLocationProviderClient(this)
+                val c = object : LocationCallback() {
+                    override fun onLocationResult(r: LocationResult) { for (x in r.locations) onLocationChanged(x) }
+                }
+                val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000L).setMinUpdateIntervalMillis(2000L).build()
+                f.requestLocationUpdates(req, c, Looper.getMainLooper())
+                fused = f; cb = c
+                return
+            } catch (e: Exception) {}
+        }
+        try { lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000, 0f, this, Looper.getMainLooper()) } catch (e: Exception) {}
+    }
+
+    @Suppress("DEPRECATION")
     override fun onLocationChanged(l: Location) {
-        if (!prefs(this).getBoolean("active", false) || l.accuracy > 200) return
-        val ts = System.currentTimeMillis()
-        val v = ContentValues().apply { put("ts", ts); put("lat", l.latitude); put("lng", l.longitude); put("acc", l.accuracy.toDouble()) }
+        if (!prefs(this).getBoolean("active", false)) return
+        val fake = if (Build.VERSION.SDK_INT >= 31) l.isMock else l.isFromMockProvider
+        if (fake) { prefs(this).edit().putBoolean("mock", true).apply(); return }   // fake-GPS apps
+        if (l.accuracy > 30f) return   // only good fixes
+        val now = System.currentTimeMillis()
+        val d = FloatArray(1)
+        if (sTs > 0) {   // reject impossible jumps (> 40 m/s)
+            Location.distanceBetween(sLat, sLng, l.latitude, l.longitude, d)
+            val dt = (now - sTs) / 1000f
+            if (dt > 0 && dt < 120 && d[0] / dt > 40f) return
+        }
+        if (kVar < 0f) { kLat = l.latitude; kLng = l.longitude; kVar = l.accuracy * l.accuracy }
+        else {           // Kalman smoothing: trust accurate fixes more
+            kVar += ((now - kTs) / 1000f) * 9f
+            val g = kVar / (kVar + l.accuracy * l.accuracy)
+            kLat += g * (l.latitude - kLat); kLng += g * (l.longitude - kLng); kVar *= (1 - g)
+        }
+        kTs = now
+        prefs(this).edit().putString("last", "{\"latitude\":$kLat,\"longitude\":$kLng,\"accuracy\":${l.accuracy},\"ts\":$now}").apply()
+        if (sTs > 0) {   // standing still: store at most one point a minute
+            Location.distanceBetween(sLat, sLng, kLat, kLng, d)
+            if (d[0] < Math.max(12f, l.accuracy * 0.6f) && now - sTs < 60000) return
+        }
+        sLat = kLat; sLng = kLng; sTs = now
+        val v = ContentValues().apply { put("ts", now); put("lat", kLat); put("lng", kLng); put("acc", l.accuracy.toDouble()) }
         db.writableDatabase.insertWithOnConflict("pts", null, v, SQLiteDatabase.CONFLICT_IGNORE)
-        prefs(this).edit().putString("last", "{\"latitude\":${l.latitude},\"longitude\":${l.longitude},\"accuracy\":${l.accuracy},\"ts\":$ts}").apply()
     }
     override fun onProviderEnabled(p: String) {}
     override fun onProviderDisabled(p: String) {}
