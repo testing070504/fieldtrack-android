@@ -2,6 +2,8 @@ package com.fieldtrack.app
 
 import android.app.*
 import android.content.*
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.database.DatabaseUtils
 import android.database.sqlite.SQLiteDatabase
@@ -11,6 +13,7 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.*
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -50,7 +53,14 @@ class LocationService : Service(), LocationListener {
     private var netCb: ConnectivityManager.NetworkCallback? = null
     private var fused: FusedLocationProviderClient? = null
     private var cb: LocationCallback? = null
-    private val tick = object : Runnable { override fun run() { upload(); h.postDelayed(this, 20000) } }
+    private var hbTs = 0L
+    private val tick = object : Runnable {
+        override fun run() {
+            upload()
+            if (prefs(this@LocationService).getBoolean("active", false) && System.currentTimeMillis() - hbTs > 60000) { hbTs = System.currentTimeMillis(); heartbeat() }
+            h.postDelayed(this, 20000)
+        }
+    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -67,7 +77,7 @@ class LocationService : Service(), LocationListener {
         if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel("trk", "Tracking", NotificationManager.IMPORTANCE_LOW))
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val n = NotificationCompat.Builder(this, "trk").setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle("FieldTrack").setContentText("Work day tracking is active").setContentIntent(pi).setOngoing(true).build()
+            .setContentTitle("Get Tracked").setContentText("Work day tracking is active").setContentIntent(pi).setOngoing(true).build()
         if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION) else startForeground(1, n)
     }
 
@@ -152,6 +162,62 @@ class LocationService : Service(), LocationListener {
     override fun onProviderEnabled(p: String) {}
     override fun onProviderDisabled(p: String) {}
     @Deprecated("old API") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
+
+    private fun postJson(url: String, tok: String, body: String): Int {
+        val u = URL(url).openConnection() as HttpURLConnection
+        u.requestMethod = "POST"; u.connectTimeout = 15000; u.readTimeout = 20000; u.doOutput = true
+        u.setRequestProperty("Content-Type", "application/json"); u.setRequestProperty("Authorization", "Bearer $tok")
+        u.outputStream.use { it.write(body.toByteArray()) }
+        val c = u.responseCode; u.disconnect(); return c
+    }
+
+    // Why did the app stop last time? (Android 11+). Reported once, so the admin can see force-stops.
+    private fun exitEvents(): JSONArray? {
+        if (Build.VERSION.SDK_INT < 30) return null
+        val last = prefs(this).getLong("exitChk", 0L)
+        val out = JSONArray()
+        try {
+            val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+            for (i in am.getHistoricalProcessExitReasons(packageName, 0, 8)) {
+                if (i.timestamp <= last) continue
+                val t = when (i.reason) {
+                    ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED -> "force_stop"
+                    ApplicationExitInfo.REASON_LOW_MEMORY -> "killed_memory"
+                    ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> "crash"
+                    ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE, ApplicationExitInfo.REASON_SIGNALED, ApplicationExitInfo.REASON_OTHER -> "killed"
+                    else -> null
+                } ?: continue
+                out.put(JSONObject().put("ts", i.timestamp).put("type", t))
+            }
+        } catch (e: Exception) {}
+        return if (out.length() > 0) out else null
+    }
+
+    // Sent every minute while on duty: battery, GPS switch, internet, background-location permission, fake-GPS flag
+    private fun heartbeat() {
+        Thread {
+            try {
+                val p = prefs(this)
+                val base = p.getString("base", "") ?: ""
+                val tok = p.getString("token", "") ?: ""
+                val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val lvl = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                val sc = b?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                val st = b?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                val pct = if (lvl >= 0 && sc > 0) lvl * 100 / sc else -1
+                val chg = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+                val gps = lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                val net = cm.getNetworkCapabilities(cm.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+                val bg = Build.VERSION.SDK_INT < 29 || ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
+                val j = JSONObject().put("battery", pct).put("charging", if (chg) 1 else 0).put("gps", if (gps) 1 else 0)
+                    .put("net", if (net) 1 else 0).put("bg", if (bg) 1 else 0).put("mock", if (p.getBoolean("mock", false)) 1 else 0)
+                val ev = exitEvents()
+                if (ev != null) j.put("events", ev)
+                if (postJson("$base/api/health", tok, j.toString()) == 200) p.edit().putLong("exitChk", System.currentTimeMillis()).apply()
+            } catch (e: Exception) {}
+        }.start()
+    }
 
     private fun upload() {
         if (busy) return
