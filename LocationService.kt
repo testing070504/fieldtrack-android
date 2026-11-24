@@ -8,6 +8,10 @@ import android.content.pm.ServiceInfo
 import android.database.DatabaseUtils
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -43,7 +47,7 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
-class LocationService : Service(), LocationListener {
+class LocationService : Service(), LocationListener, SensorEventListener {
     private lateinit var lm: LocationManager
     private lateinit var db: Db
     private val h = Handler(Looper.getMainLooper())
@@ -93,7 +97,8 @@ class LocationService : Service(), LocationListener {
 
     private fun begin() {
         if (on) return
-        on = true; kVar = -1f; sTs = 0L
+        on = true; kVar = -1f; sTs = 0L; hasAnchor = false; rejN = 0; spd = 0f; still = false
+        try { sm = getSystemService(SENSOR_SERVICE) as SensorManager; sm?.registerListener(this, sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), SensorManager.SENSOR_DELAY_NORMAL) } catch (e: Exception) {}
         wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ft:trk").also { it.acquire() }
         startLocation()
         try {
@@ -105,6 +110,7 @@ class LocationService : Service(), LocationListener {
 
     private fun endTracking() {
         on = false
+        try { sm?.unregisterListener(this) } catch (e: Exception) {}
         try { lm.removeUpdates(this) } catch (e: Exception) {}
         try { cb?.let { fused?.removeLocationUpdates(it) } } catch (e: Exception) {}
         wl?.let { if (it.isHeld) it.release() }
@@ -112,6 +118,10 @@ class LocationService : Service(), LocationListener {
 
     private var kLat = 0.0; private var kLng = 0.0; private var kVar = -1f; private var kTs = 0L
     private var sLat = 0.0; private var sLng = 0.0; private var sTs = 0L
+    private var sm: SensorManager? = null
+    private var aMean = 9.8f; private var aVar = 1f; private var still = false; private var stillSince = 0L
+    private var anchorLat = 0.0; private var anchorLng = 0.0; private var hasAnchor = false
+    private var rejN = 0; private var rejLat = 0.0; private var rejLng = 0.0; private var spd = 0f
 
     private fun startLocation() {
         val ok = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(this) == ConnectionResult.SUCCESS
@@ -130,19 +140,47 @@ class LocationService : Service(), LocationListener {
         try { lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000, 0f, this, Looper.getMainLooper()) } catch (e: Exception) {}
     }
 
+    // Motion sensor: is the phone lying still? (tiny, steady acceleration for a while)
+    override fun onSensorChanged(e: SensorEvent) {
+        val m = Math.sqrt((e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2]).toDouble()).toFloat()
+        val dv = m - aMean
+        aMean += 0.05f * dv
+        aVar = aVar * 0.95f + 0.05f * dv * dv
+        val s = aVar < 0.04f
+        if (s && !still) stillSince = System.currentTimeMillis()
+        still = s
+    }
+    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+
+    private fun publish(lat: Double, lng: Double, acc: Float, ts: Long) {
+        prefs(this).edit().putString("last", "{\"latitude\":$lat,\"longitude\":$lng,\"accuracy\":$acc,\"ts\":$ts}").apply()
+    }
+
     @Suppress("DEPRECATION")
     override fun onLocationChanged(l: Location) {
         if (!prefs(this).getBoolean("active", false)) return
         val fake = if (Build.VERSION.SDK_INT >= 31) l.isMock else l.isFromMockProvider
         if (fake) { prefs(this).edit().putBoolean("mock", true).apply(); return }   // fake-GPS apps
-        if (l.accuracy > 30f) return   // only good fixes
+        if (l.accuracy > 25f) return   // only good fixes
         val now = System.currentTimeMillis()
         val d = FloatArray(1)
-        if (sTs > 0) {   // reject impossible jumps (> 40 m/s)
+        val moving = l.hasSpeed() && l.speed > 1.2f
+        // 1) Phone is lying still (motion sensor quiet for 15 s, GPS shows no speed): hold the position, ignore GPS wobble
+        if (still && hasAnchor && !moving && now - stillSince > 15000) { publish(anchorLat, anchorLng, l.accuracy, now); return }
+        // 2) Outlier gate: a jump faster than the phone itself reports is rejected, unless 3 readings in a row agree on the new place
+        if (sTs > 0) {
             Location.distanceBetween(sLat, sLng, l.latitude, l.longitude, d)
             val dt = (now - sTs) / 1000f
-            if (dt > 0 && dt < 120 && d[0] / dt > 40f) return
+            val limit = Math.max(8f, 2.5f * Math.max(spd, if (l.hasSpeed()) l.speed else 0f) + 6f)
+            if (dt > 0 && dt < 120 && d[0] > 40f && d[0] / dt > limit) {
+                val dd = FloatArray(1)
+                Location.distanceBetween(rejLat, rejLng, l.latitude, l.longitude, dd)
+                rejN = if (rejN > 0 && dd[0] < 30f) rejN + 1 else 1
+                rejLat = l.latitude; rejLng = l.longitude
+                if (rejN < 3) return
+            } else if (dt > 0) spd = 0.6f * spd + 0.4f * (d[0] / dt)
         }
+        rejN = 0
         if (kVar < 0f) { kLat = l.latitude; kLng = l.longitude; kVar = l.accuracy * l.accuracy }
         else {           // Kalman smoothing: trust accurate fixes more
             kVar += ((now - kTs) / 1000f) * 9f
@@ -150,12 +188,13 @@ class LocationService : Service(), LocationListener {
             kLat += g * (l.latitude - kLat); kLng += g * (l.longitude - kLng); kVar *= (1 - g)
         }
         kTs = now
-        prefs(this).edit().putString("last", "{\"latitude\":$kLat,\"longitude\":$kLng,\"accuracy\":${l.accuracy},\"ts\":$now}").apply()
+        publish(kLat, kLng, l.accuracy, now)
         if (sTs > 0) {   // standing still: store at most one point a minute
             Location.distanceBetween(sLat, sLng, kLat, kLng, d)
             if (d[0] < Math.max(12f, l.accuracy * 0.6f) && now - sTs < 60000) return
         }
         sLat = kLat; sLng = kLng; sTs = now
+        anchorLat = kLat; anchorLng = kLng; hasAnchor = true
         val v = ContentValues().apply { put("ts", now); put("lat", kLat); put("lng", kLng); put("acc", l.accuracy.toDouble()) }
         db.writableDatabase.insertWithOnConflict("pts", null, v, SQLiteDatabase.CONFLICT_IGNORE)
     }

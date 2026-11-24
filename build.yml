@@ -1,0 +1,68 @@
+name: Build Get Tracked APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Arrange project files and create icons
+        run: |
+          mkdir -p app/src/main/java/com/fieldtrack/app app/src/main/res/xml
+          [ -f AndroidManifest.xml ] && mv AndroidManifest.xml app/src/main/AndroidManifest.xml || true
+          for f in LocationService MainActivity AdminReceiver; do [ -f $f.kt ] && mv $f.kt app/src/main/java/com/fieldtrack/app/ || true; done
+          [ -f get-tracked.p12 ] && mv get-tracked.p12 app/ || true
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<device-admin xmlns:android="http://schemas.android.com/apk/res/android"><uses-policies/></device-admin>\n' > app/src/main/res/xml/device_admin.xml
+          cat > settings.gradle <<'EOT'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins {
+                  id 'com.android.application' version '8.5.2'
+                  id 'org.jetbrains.kotlin.android' version '1.9.24'
+              }
+          }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GetTracked"
+          include ':app'
+          EOT
+          echo '// top-level' > build.gradle
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > app/build.gradle <<'EOT'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+              namespace 'com.fieldtrack.app'
+              compileSdk 34
+              defaultConfig { applicationId 'com.fieldtrack.app'; minSdk 24; targetSdk 34; versionCode 3; versionName '1.2' }
+              signingConfigs {
+                  debug {
+                      if (file('get-tracked.p12').exists()) {
+                          storeFile file('get-tracked.p12'); storePassword 'gettracked'; keyAlias 'gettracked'; keyPassword 'gettracked'
+                      }
+                  }
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.13.1'
+              implementation 'com.google.android.gms:play-services-location:21.3.0'
+          }
+          EOT
+          pip install --quiet --break-system-packages pillow || sudo apt-get install -y python3-pil
+          python3 make_icons.py
+          find app -type f | sort
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - run: gradle assembleDebug --no-daemon
+      - run: cp app/build/outputs/apk/debug/app-debug.apk Get-Tracked.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Get-Tracked-APK
+          path: Get-Tracked.apk

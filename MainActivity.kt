@@ -14,6 +14,7 @@ import android.provider.Settings
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -36,7 +37,17 @@ class MainActivity : Activity() {
         w.settings.javaScriptEnabled = true
         w.settings.domStorageEnabled = true
         w.settings.mediaPlaybackRequiresUserGesture = false
-        w.webViewClient = WebViewClient()
+        w.webViewClient = object : WebViewClient() {
+            // Links to WhatsApp, phone dialer and receipts open outside the app; the app's own pages stay inside
+            override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                val u = r.url
+                val base = Uri.parse(prefs(this@MainActivity).getString("base", "") ?: "")
+                val mine = (u.scheme == "http" || u.scheme == "https") && u.host == base.host && !(u.path ?: "").startsWith("/r/")
+                if (mine) return false
+                try { startActivity(Intent(Intent.ACTION_VIEW, u)) } catch (e: Exception) {}
+                return true
+            }
+        }
         w.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(r: PermissionRequest) { runOnUiThread { r.grant(r.resources) } }
         }
